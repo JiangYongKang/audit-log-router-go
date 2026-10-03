@@ -16,6 +16,7 @@ import (
 
 	"github.com/highcumontoa/audit-log-router-go/internal/downstream"
 	"github.com/highcumontoa/audit-log-router-go/internal/event"
+	"github.com/highcumontoa/audit-log-router-go/internal/freeze"
 	"github.com/highcumontoa/audit-log-router-go/internal/policy"
 	"github.com/highcumontoa/audit-log-router-go/internal/retention"
 	"github.com/highcumontoa/audit-log-router-go/internal/router"
@@ -45,8 +46,16 @@ func main() {
 	}
 	defer st.Close()
 
+	// 合规冻结注册表（freeze.log 持久化，重启后重放恢复）。
+	fr, err := freeze.Open(*dir)
+	if err != nil {
+		logger.Fatalf("open freeze registry: %v", err)
+	}
+	defer fr.Close()
+
 	r := router.New(engine, st, router.Config{
 		QueueSize: 128, MaxRetries: 3, RetryBackoff: 20 * time.Millisecond, Logger: logger,
+		MaxCount: p.RetentionCount, IsFrozen: fr.IsFrozen,
 	})
 	for _, name := range []string{"archive", "siem"} {
 		t, err := downstream.NewFileTarget(name, *dir+"/targets")
@@ -63,11 +72,13 @@ func main() {
 
 	maxAge, _ := p.ParseAge()
 	sw := retention.New(st, time.Second, maxAge, p.RetentionCount, p.SegmentBytes)
+	sw.SetFreezeHook(fr.IsFrozen, logger)
 	sw.Start(ctx)
 	defer sw.Stop()
 
 	if *demo {
 		runDemo(ctx, r, logger)
+		runFreezeDemo(ctx, fr, st, logger)
 	}
 
 	stopCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -121,4 +132,31 @@ func runDemo(ctx context.Context, r *router.Router, logger *log.Logger) {
 		}
 	}
 	time.Sleep(300 * time.Millisecond) // 等待投递循环
+}
+
+// runFreezeDemo 演示合规冻结：按 ID 冻结、按条件冻结、状态核查与解冻。
+func runFreezeDemo(ctx context.Context, fr *freeze.Registry, st *store.Store, logger *log.Logger) {
+	rep, err := fr.FreezeIDs(st, "evt-1")
+	if err != nil {
+		logger.Printf("freeze by id: %v", err)
+		return
+	}
+	logger.Printf("freeze by id: changed=%v skipped=%v", rep.Changed, rep.Skipped)
+
+	crep, err := fr.FreezeByCriteria(st, freeze.Criteria{Actor: "alice", Type: "login"})
+	if err != nil {
+		logger.Printf("freeze by criteria: %v", err)
+		return
+	}
+	logger.Printf("freeze by criteria(actor=alice,type=login): changed=%v", crep.Changed)
+	logger.Printf("frozen status: count=%d ids=%v is_frozen(evt-1)=%v",
+		fr.FrozenCount(), fr.FrozenIDs(), fr.IsFrozen("evt-1"))
+
+	urep, err := fr.UnfreezeByCriteria(st, freeze.Criteria{Actor: "alice"})
+	if err != nil {
+		logger.Printf("unfreeze: %v", err)
+		return
+	}
+	logger.Printf("unfreeze by criteria(actor=alice): changed=%v remaining=%v", urep.Changed, fr.FrozenIDs())
+	_ = ctx
 }

@@ -41,6 +41,9 @@ const (
 	RejectMissingRequired RejectReason = "missing_required_field"
 	RejectRuleConflict    RejectReason = "rule_conflict"
 	RejectDuplicateID     RejectReason = "duplicate_id"
+	// RejectCapacityFrozen 表示容量上限已被（含冻结记录的）留存占满，
+	// 无可回收段，写入被明确拒绝而非悄悄丢弃。
+	RejectCapacityFrozen RejectReason = "capacity_frozen"
 )
 
 // RejectError 携带被拒绝的原因与可读说明（说明中不得包含敏感原始值）。

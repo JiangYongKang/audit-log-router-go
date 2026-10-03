@@ -31,6 +31,13 @@ type Config struct {
 	MaxRetries   int           // 单条事件最大重试次数
 	RetryBackoff time.Duration // 重试间隔
 	Logger       *log.Logger   // 判定依据日志（可选）
+
+	// 容量门控（可选）：MaxCount>0 时，若留存总数已达上限且没有任何
+	// 可被清理回收的段（全部被冻结保护或只有活动段），写入以
+	// capacity_frozen 明确拒绝，而不是悄悄超量或挤掉冻结记录。
+	// IsFrozen 为冻结状态查询（可为 nil，等价于无冻结）。
+	MaxCount int64
+	IsFrozen func(id string) bool
 }
 
 func (c *Config) withDefaults() {
@@ -258,6 +265,21 @@ func (r *Router) Ingest(ctx context.Context, ev event.Event) error {
 		r.rejected++
 		r.logf("ingest rejected: id=%q reason=%s", ev.ID, event.RejectDuplicateID)
 		return &event.RejectError{Reason: event.RejectDuplicateID, Detail: "event id already ingested"}
+	}
+
+	// 容量门控：达到上限且无可回收段（冻结占用或仅有活动段）时明确拒绝。
+	if r.cfg.MaxCount > 0 && r.store.Count() >= r.cfg.MaxCount {
+		reclaim, err := r.store.ReclaimableCount(r.cfg.IsFrozen)
+		if err != nil {
+			return fmt.Errorf("check reclaimable capacity: %w", err)
+		}
+		if reclaim == 0 {
+			r.rejected++
+			detail := fmt.Sprintf("retention count %d reached and no reclaimable segment (capacity held by frozen records or active segment)",
+				r.cfg.MaxCount)
+			r.logf("ingest rejected: id=%q reason=%s detail=%q", ev.ID, event.RejectCapacityFrozen, detail)
+			return &event.RejectError{Reason: event.RejectCapacityFrozen, Detail: detail}
+		}
 	}
 
 	seq, err := r.store.Append(dec.Record)

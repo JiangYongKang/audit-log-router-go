@@ -257,6 +257,37 @@ func (s *Store) LastSeq() int64 {
 	return s.lastSeq
 }
 
+// ReclaimableCount 统计「可被清理回收」的记录数：不含冻结记录的封存段之记录总数。
+// isFrozen 为 nil 时等价于无冻结（所有封存段均可回收）。
+// 活动段不可删除，因此永远不计入可回收。
+// 调用方可在持锁回调中查询冻结状态（锁序：store 锁 -> 冻结锁）。
+func (s *Store) ReclaimableCount(isFrozen func(id string) bool) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int64
+	for _, seg := range s.sealed {
+		if isFrozen == nil {
+			n += seg.Count
+			continue
+		}
+		recs, err := scanFile(seg.Path, seg.StartSeq, seg.EndSeq+1)
+		if err != nil {
+			return n, err
+		}
+		frozen := false
+		for _, rec := range recs {
+			if isFrozen(rec.ID) {
+				frozen = true
+				break
+			}
+		}
+		if !frozen {
+			n += seg.Count
+		}
+	}
+	return n, nil
+}
+
 // Count 返回当前留存的事件总数（活动段 + 封存段）。
 func (s *Store) Count() int64 {
 	s.mu.Lock()

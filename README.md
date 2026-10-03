@@ -22,6 +22,8 @@ event.Record (只含脱敏后的值 + policy_version + masked 字段清单)
    delivery.log：enqueued / delivered / dropped(带原因) 状态机（fsync）
    │
 retention.Sweeper：按保留期 / 容量上限，从最旧段开始确定性清理
+   │   （含冻结记录的段一律跳过；冻结占满容量时给出确定结论）
+freeze.Registry：合规冻结（legal hold），freeze.log 持久化，重启重放恢复
 ```
 
 ## 事件模型
@@ -70,6 +72,33 @@ retention.Sweeper：按保留期 / 容量上限，从最旧段开始确定性清
   `retention_count` 从最旧段补足；活动段从不删除。
 - 所有读写共用存储互斥锁；崩溃重放时截断末尾半写行；`PurgeReport` 逐段说明删除原因与计数。
 
+## 合规冻结（legal hold）
+
+给法务/合规排查使用：被冻结的记录**不参与保留期清理与容量挤出**，解冻后按原规则重新参与。
+
+- **冻结方式**（`freeze.Registry`）：
+  - `FreezeIDs`：按事件标识冻结；未找到的 ID 计入报告的 `Skipped`；
+  - `FreezeByCriteria`：按条件批量冻结，条件字段为 `actor`（来源）、`type`（类型）、
+    `from`/`to`（时间闭区间，含边界）；**空条件被拒绝**（`ErrEmptyCriteria`），防止误全量冻结；
+  - `UnfreezeIDs` / `UnfreezeByCriteria`：对称的解冻；`IsFrozen` / `FrozenIDs` / `FrozenCount` 核查状态。
+- **幂等与计数自洽**：冻结集合是 ID 集合（set 语义）。重复冻结/解冻是 no-op——不重复写日志、
+  不改变计数；每次操作返回 `Report{Changed, Skipped}`，只列实际改变状态的记录。
+- **持久化**：所有实际改变集合的操作追加到 `<dir>/freeze.log` 并 fsync；重启重放恢复，
+  半写行在 Open 时截断。重启前后对同一批记录的清理结论一致。
+- **与留存的关系**：清理以段为单位——**段内含任意一条冻结记录，该段整体跳过**
+  （保留期与容量两个阶段都跳过），跳过的段写入 `PurgeReport.Reason`
+  （`kept_frozen_segments=...`）并打印运行日志。解冻本身不删除任何数据；
+  下一次清理按原保留期/容量规则处理已解冻的段。
+- **与容量的关系**（确定性行为）：
+  - 冻结记录永不因容量压力被挤掉；容量清理只从「不含冻结记录的封存段」中回收；
+  - 若冻结占用导致无法回收到上限以下，清理报告给出 `capacity_unreclaimable:...`
+    说明（超量是当前确定状态，不是静默失败）；
+  - 写入侧门控（`router.Config.MaxCount` + `IsFrozen`，示例程序已接线）：留存总数达上限
+    且没有任何可回收段时，`Ingest` 以 `capacity_frozen` **明确拒绝**（`RejectError`，
+    可与其他拒绝原因区分），而不是悄悄丢弃或让存储无限增长。
+- **兼容范围**：不注册冻结钩子（`Sweeper.SetFreezeHook` 不调用、`Router.Config.MaxCount=0`）时，
+  留存、清理与写入行为与引入冻结能力前完全一致；`freeze.log` 缺失时从空集合开始。
+
 ## 本地验证
 
 ```bash
@@ -91,6 +120,12 @@ go test ./internal/router -race -v
 | `TestSweepAgeExceeded` / `TestSweepCountExceededOldestFirst` | 留存边界与确定清理顺序 |
 | `TestDownstreamDedupByID` / `TestFileTargetDedupAcrossRestart` | 进程内与跨重启的下游幂等去重 |
 | `TestLedgerIsAuditable` | `delivery.log` 三态齐备且 dropped 带原因 |
+| `TestFreezeUnfreezeByID` / `TestFreezeByCriteriaBoundaries` | 按 ID/条件冻结解冻、闭区间边界、空条件拒绝、幂等计数 |
+| `TestFreezePersistsAcrossRestart` / `TestFreezeRestartKeepsSameSweepDecision` | 重启后冻结状态恢复，清理结论一致 |
+| `TestSweepSkipsFrozenSegments` / `TestUnfreezeRestoresOriginalPurge` | 冻结段跳过清理；解冻后按原规则参与清理 |
+| `TestSweepCapacityUnreclaimableWhenFrozen` | 容量被冻结占满时的确定结论，冻结记录不被挤掉 |
+| `TestConcurrentFreezeSweepAppend` | 冻结/解冻/写入/清理并发，冻结记录不丢、计数自洽 |
+| `TestIngestRejectedWhenCapacityFrozen` / `TestIngestUnaffectedWithoutCapacityGate` | 容量门控拒绝可区分；无门控时行为不变 |
 
 示例程序：
 
@@ -101,4 +136,5 @@ go run ./cmd/auditrouter --demo --dir ./data \
 ```
 
 输出可在 `data/events-active.log`（留存记录）、`data/delivery.log`（投递状态）、
-`data/targets/*.log`（下游收到的记录）中核查。
+`data/targets/*.log`（下游收到的记录）、`data/freeze.log`（冻结操作日志）中核查。
+demo 模式会额外演示一次按 ID 冻结、按条件冻结、状态核查与解冻。

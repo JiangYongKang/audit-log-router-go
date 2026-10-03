@@ -5,6 +5,7 @@ package retention
 import (
 	"context"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -20,6 +21,11 @@ type Sweeper struct {
 	maxCount int64
 	segBytes int64
 
+	// 冻结钩子（可选）：非 nil 时，含冻结记录的段跳过一切清理。
+	// 不设置时行为与引入冻结能力前完全一致。
+	isFrozen func(id string) bool
+	logger   *log.Logger
+
 	cancel func()
 	done   chan struct{}
 }
@@ -31,6 +37,19 @@ func New(st *store.Store, interval, maxAge time.Duration, maxCount, segBytes int
 		maxAge:   maxAge,
 		maxCount: maxCount,
 		segBytes: segBytes,
+	}
+}
+
+// SetFreezeHook 注册冻结判定函数与判定日志（均可在引入冻结能力后接入）。
+// isFrozen 为 nil 时恢复为无冻结行为。须在 Start/首次 Sweep 前设置。
+func (s *Sweeper) SetFreezeHook(isFrozen func(id string) bool, logger *log.Logger) {
+	s.isFrozen = isFrozen
+	s.logger = logger
+}
+
+func (s *Sweeper) logf(format string, args ...any) {
+	if s.logger != nil {
+		s.logger.Printf(format, args...)
 	}
 }
 
@@ -88,11 +107,34 @@ func (s *Sweeper) Sweep(ctx context.Context, now time.Time) (*store.PurgeReport,
 	indexes := map[int]bool{}
 	projectedCount := s.st.Count()
 
+	// 冻结判定：含冻结记录的段从两个阶段候选中剔除，理由可核查。
+	frozenSeg := map[int]bool{}
+	var frozenProtected int64
+	if s.isFrozen != nil {
+		for _, seg := range sealed {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			has, err := s.segHasFrozen(seg)
+			if err != nil {
+				return nil, err
+			}
+			if has {
+				frozenSeg[seg.Index] = true
+				frozenProtected += seg.Count
+				s.logf("retention: segment %06d kept (frozen_hold, count=%d)", seg.Index, seg.Count)
+			}
+		}
+	}
+
 	// 阶段 1：超过保留期的段（从最旧开始）。
 	if s.maxAge > 0 {
 		for _, seg := range sealed {
 			if err := ctx.Err(); err != nil {
 				return nil, err
+			}
+			if frozenSeg[seg.Index] {
+				continue
 			}
 			oldest, err := s.oldestTimestamp(seg)
 			if err != nil {
@@ -106,13 +148,13 @@ func (s *Sweeper) Sweep(ctx context.Context, now time.Time) (*store.PurgeReport,
 		}
 	}
 
-	// 阶段 2：容量上限挤出（继续从最旧段开始补足）。
+	// 阶段 2：容量上限挤出（继续从最旧段开始补足；冻结段不可挤出）。
 	if s.maxCount > 0 {
 		for _, seg := range sealed {
 			if projectedCount <= s.maxCount {
 				break
 			}
-			if !indexes[seg.Index] {
+			if !indexes[seg.Index] && !frozenSeg[seg.Index] {
 				marks = append(marks, mark{seg, "count_exceeded"})
 				indexes[seg.Index] = true
 				projectedCount -= seg.Count
@@ -120,16 +162,38 @@ func (s *Sweeper) Sweep(ctx context.Context, now time.Time) (*store.PurgeReport,
 		}
 	}
 
+	var reasons []string
+	for _, m := range marks {
+		reasons = append(reasons, fmt.Sprintf("seg-%06d(%s,count=%d):%s",
+			m.seg.Index, m.seg.StartID, m.seg.Count, m.reason))
+	}
+
+	// 冻结跳过的段写入报告理由；冻结占用导致无法回收到上限以下时，
+	// 给出确定、可解释的结论，而不是静默超量。
+	if len(frozenSeg) > 0 {
+		var idxs []string
+		for _, seg := range sealed {
+			if frozenSeg[seg.Index] {
+				idxs = append(idxs, fmt.Sprintf("%06d", seg.Index))
+			}
+		}
+		sort.Strings(idxs)
+		reasons = append(reasons, fmt.Sprintf("kept_frozen_segments=%s", strings.Join(idxs, ",")))
+		if s.maxCount > 0 && projectedCount > s.maxCount {
+			s.logf("retention: capacity cannot be fully reclaimed: projected=%d > max=%d, %d record(s) in %d segment(s) protected by freeze",
+				projectedCount, s.maxCount, frozenProtected, len(frozenSeg))
+			reasons = append(reasons, fmt.Sprintf("capacity_unreclaimable:projected=%d,max=%d,frozen_protected=%d",
+				projectedCount, s.maxCount, frozenProtected))
+		}
+	}
+
 	if len(marks) == 0 {
-		return &store.PurgeReport{}, nil
+		return &store.PurgeReport{Reason: strings.Join(reasons, "; ")}, nil
 	}
 
 	idxs := make([]int, 0, len(marks))
-	var reasons []string
 	for _, m := range marks {
 		idxs = append(idxs, m.seg.Index)
-		reasons = append(reasons, fmt.Sprintf("seg-%06d(%s,count=%d):%s",
-			m.seg.Index, m.seg.StartID, m.seg.Count, m.reason))
 	}
 	sort.Ints(idxs)
 	rep, err := s.st.DeleteSegments(idxs)
@@ -138,6 +202,20 @@ func (s *Sweeper) Sweep(ctx context.Context, now time.Time) (*store.PurgeReport,
 	}
 	rep.Reason = strings.Join(reasons, "; ")
 	return rep, nil
+}
+
+// segHasFrozen 判断段内是否含冻结记录（扫描该段 seq 区间）。
+func (s *Sweeper) segHasFrozen(seg store.Segment) (bool, error) {
+	recs, err := s.st.ScanSeqs(context.Background(), seg.StartSeq, seg.EndSeq+1)
+	if err != nil {
+		return false, err
+	}
+	for _, rec := range recs {
+		if s.isFrozen(rec.ID) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // oldestTimestamp 读取段内最早事件时间（扫描该段 seq 区间）。
