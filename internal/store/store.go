@@ -19,6 +19,7 @@ import (
 	"sync"
 
 	"github.com/highcumontoa/audit-log-router-go/internal/event"
+	"github.com/highcumontoa/audit-log-router-go/internal/freeze"
 )
 
 const activeName = "events-active.log"
@@ -51,6 +52,7 @@ type Store struct {
 	activeSeg Segment
 	sealed    []Segment // 按 Index 升序
 	lastSeq   int64
+	idToSeq   map[string]int64 // 事件 ID -> 序号（重放与追加时维护，供合规冻结解析）
 }
 
 // Open 打开（必要时创建）存储目录并重放已有段。
@@ -58,7 +60,7 @@ func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir}
+	s := &Store{dir: dir, idToSeq: map[string]int64{}}
 
 	// 收集已封存段。
 	entries, err := os.ReadDir(dir)
@@ -144,6 +146,7 @@ func (s *Store) replaySegment(path string, idx int, sealed bool) (Segment, error
 		if ln.Seq > s.lastSeq {
 			s.lastSeq = ln.Seq
 		}
+		s.idToSeq[ln.Record.ID] = ln.Seq
 	}
 	seg.Size = goodOffset
 
@@ -193,6 +196,7 @@ func (s *Store) Append(r event.Record) (int64, error) {
 	s.activeSeg.Count++
 	s.activeSeg.Size += int64(len(b))
 	s.lastSeq = seq
+	s.idToSeq[r.ID] = seq
 	return seq, nil
 }
 
@@ -210,16 +214,41 @@ func (s *Store) ScanSeqs(ctx context.Context, from int64, to int64) ([]event.Rec
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		recs, err := scanFile(p, from, to)
+		lns, err := scanLinesFile(p, from, to)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, recs...)
+		for _, ln := range lns {
+			out = append(out, ln.Record)
+		}
 	}
 	return out, nil
 }
 
-func scanFile(path string, from, to int64) ([]event.Record, error) {
+// scanLines 与 ScanSeqs 相同，但返回带序号的整行（冻结条件解析用）。
+func (s *Store) ScanLines(ctx context.Context, from, to int64) ([]event.Line, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []event.Line
+	paths := make([]string, 0, len(s.sealed)+1)
+	for _, seg := range s.sealed {
+		paths = append(paths, seg.Path)
+	}
+	paths = append(paths, filepath.Join(s.dir, activeName))
+	for _, p := range paths {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		lns, err := scanLinesFile(p, from, to)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, lns...)
+	}
+	return out, nil
+}
+
+func scanLinesFile(path string, from, to int64) ([]event.Line, error) {
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -228,7 +257,7 @@ func scanFile(path string, from, to int64) ([]event.Record, error) {
 		return nil, err
 	}
 	defer f.Close()
-	var out []event.Record
+	var out []event.Line
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 16<<20)
 	for sc.Scan() {
@@ -246,9 +275,21 @@ func scanFile(path string, from, to int64) ([]event.Record, error) {
 		if to > 0 && ln.Seq >= to {
 			return out, nil
 		}
-		out = append(out, ln.Record)
+		out = append(out, ln)
 	}
 	return out, sc.Err()
+}
+
+func scanFile(path string, from, to int64) ([]event.Record, error) {
+	lns, err := scanLinesFile(path, from, to)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]event.Record, 0, len(lns))
+	for _, ln := range lns {
+		out = append(out, ln.Record)
+	}
+	return out, nil
 }
 
 func (s *Store) LastSeq() int64 {
@@ -322,6 +363,7 @@ func (s *Store) DeleteSegments(indexes []int) (*PurgeReport, error) {
 	sort.Ints(indexes)
 	rep := &PurgeReport{}
 	keep := s.sealed[:0]
+	deletedRanges := make([][2]int64, 0, len(indexes))
 	for _, seg := range s.sealed {
 		del := false
 		for _, idx := range indexes {
@@ -336,10 +378,200 @@ func (s *Store) DeleteSegments(indexes []int) (*PurgeReport, error) {
 			}
 			rep.DeletedSegments = append(rep.DeletedSegments, seg)
 			rep.DeletedCount += seg.Count
+			deletedRanges = append(deletedRanges, [2]int64{seg.StartSeq, seg.EndSeq})
 		} else {
 			keep = append(keep, seg)
 		}
 	}
 	s.sealed = keep
+	// 维护 ID->序号索引：段内序号连续且段间不重叠，按区间精确移除。
+	if len(deletedRanges) > 0 {
+		for id, seq := range s.idToSeq {
+			for _, rng := range deletedRanges {
+				if seq >= rng[0] && seq <= rng[1] {
+					delete(s.idToSeq, id)
+					break
+				}
+			}
+		}
+	}
 	return rep, nil
+}
+
+// LookupSeq 返回事件 ID 对应的单调序号；不存在返回 (0,false,nil)。
+// 供合规冻结注册表把事件标识解析为内部序号。
+func (s *Store) LookupSeq(id string) (int64, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seq, ok := s.idToSeq[id]
+	return seq, ok, nil
+}
+
+// ScanViews 按 seq 升序返回当前全部留存记录的视图快照（供条件冻结匹配）。
+func (s *Store) ScanViews() ([]freeze.RecordView, error) {
+	lines, err := s.ScanLines(context.Background(), 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]freeze.RecordView, 0, len(lines))
+	for _, ln := range lines {
+		r := ln.Record
+		out = append(out, freeze.RecordView{
+			Seq:       ln.Seq,
+			ID:        r.ID,
+			Type:      r.Type,
+			Source:    r.Source,
+			Actor:     r.Actor,
+			Timestamp: r.Timestamp,
+		})
+	}
+	return out, nil
+}
+
+// HasSeq 判断某序号当前是否仍被留存（供冻结注册表与存储对账）。
+func (s *Store) HasSeq(seq int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 先用段区间快速排除，再扫描确认（清理后 seq 可能存在空洞）。
+	possible := false
+	for _, seg := range s.sealed {
+		if seg.Count > 0 && seq >= seg.StartSeq && seq <= seg.EndSeq {
+			possible = true
+			break
+		}
+	}
+	seg := s.activeSeg
+	if !possible && seg.Count > 0 && seq >= seg.StartSeq && seq <= seg.EndSeq {
+		possible = true
+	}
+	if !possible {
+		return false
+	}
+	lns, err := scanLinesFile(filepath.Join(s.dir, activeName), seq, seq+1)
+	if err != nil {
+		return false
+	}
+	for _, l := range lns {
+		if l.Seq == seq {
+			return true
+		}
+	}
+	for _, sp := range s.sealed {
+		if sp.Count == 0 || seq < sp.StartSeq || seq > sp.EndSeq {
+			continue
+		}
+		lns, err := scanLinesFile(sp.Path, seq, seq+1)
+		if err != nil {
+			return false
+		}
+		for _, l := range lns {
+			if l.Seq == seq {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// PurgeSegment 对一个封存段做记录级清理：仅保留 keepSeqs 中的记录，
+// 其余记录被确定性删除。用于「段内部分记录被合规冻结」的场景：
+// 已冻结记录原样保留（序号/内容不变），未冻结记录被清走。
+//
+// 返回被删除的记录数；若清理后段为空，则删除整个段文件并返回 removed=true。
+// 实现为先写临时文件并 fsync、再原子 rename，崩溃不会产生半写段。
+func (s *Store) PurgeSegment(index int, keepSeqs map[int64]bool) (deleted int64, removed bool, keptSeg Segment, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pos := -1
+	for i := range s.sealed {
+		if s.sealed[i].Index == index {
+			pos = i
+			break
+		}
+	}
+	if pos < 0 {
+		return 0, false, Segment{}, fmt.Errorf("segment %d not found or not sealed", index)
+	}
+	seg := s.sealed[pos]
+
+	lns, err := scanLinesFile(seg.Path, seg.StartSeq, seg.EndSeq+1)
+	if err != nil {
+		return 0, false, Segment{}, err
+	}
+	var keep []event.Line
+	deletedIDs := map[string]bool{}
+	for _, ln := range lns {
+		if keepSeqs[ln.Seq] {
+			keep = append(keep, ln)
+		} else {
+			deleted++
+			deletedIDs[ln.Record.ID] = true
+		}
+	}
+
+	if len(keep) == 0 {
+		// 没有需要保留的记录：直接删除整个段。
+		if rmErr := os.Remove(seg.Path); rmErr != nil && !os.IsNotExist(rmErr) {
+			return 0, false, Segment{}, rmErr
+		}
+		s.sealed = append(s.sealed[:pos], s.sealed[pos+1:]...)
+		for id := range deletedIDs {
+			delete(s.idToSeq, id)
+		}
+		emptySeg := seg
+		emptySeg.Count = 0
+		return deleted, true, emptySeg, nil
+	}
+
+	tmpPath := seg.Path + ".compact.tmp"
+	tf, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return 0, false, Segment{}, err
+	}
+	var newSize int64
+	for _, ln := range keep {
+		b, encErr := event.EncodeLine(ln.Seq, ln.Record)
+		if encErr != nil {
+			tf.Close()
+			os.Remove(tmpPath)
+			return 0, false, Segment{}, encErr
+		}
+		if _, werr := tf.Write(b); werr != nil {
+			tf.Close()
+			os.Remove(tmpPath)
+			return 0, false, Segment{}, werr
+		}
+		newSize += int64(len(b))
+	}
+	if err := tf.Sync(); err != nil {
+		tf.Close()
+		os.Remove(tmpPath)
+		return 0, false, Segment{}, err
+	}
+	if err := tf.Close(); err != nil {
+		os.Remove(tmpPath)
+		return 0, false, Segment{}, err
+	}
+	if err := os.Rename(tmpPath, seg.Path); err != nil {
+		os.Remove(tmpPath)
+		return 0, false, Segment{}, err
+	}
+
+	newSeg := Segment{
+		Path:     seg.Path,
+		Index:    seg.Index,
+		StartID:  keep[0].Record.ID,
+		EndID:    keep[len(keep)-1].Record.ID,
+		StartSeq: keep[0].Seq,
+		EndSeq:   keep[len(keep)-1].Seq,
+		Count:    int64(len(keep)),
+		Sealed:   true,
+		Size:     newSize,
+	}
+	s.sealed[pos] = newSeg
+	for id := range deletedIDs {
+		delete(s.idToSeq, id)
+	}
+	return deleted, false, newSeg, nil
 }

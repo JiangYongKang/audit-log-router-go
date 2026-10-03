@@ -12,6 +12,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/highcumontoa/audit-log-router-go/internal/downstream"
 	"github.com/highcumontoa/audit-log-router-go/internal/event"
+	"github.com/highcumontoa/audit-log-router-go/internal/freeze"
 	"github.com/highcumontoa/audit-log-router-go/internal/policy"
 	"github.com/highcumontoa/audit-log-router-go/internal/store"
 )
@@ -47,14 +49,21 @@ func (c *Config) withDefaults() {
 
 // Stats 是路由运行状态快照。
 type Stats struct {
-	Received   int64
-	Accepted   int64
-	Rejected   int64
-	Delivered  map[string]int64
-	Failed     map[string]int64
-	Dropped    map[string]int64
-	QueueDepth map[string]int
+	Received       int64
+	Accepted       int64
+	Rejected       int64
+	CapacityLocked int64 // 因容量被冻结占满而拒绝的写入数
+	Delivered      map[string]int64
+	Failed         map[string]int64
+	Dropped        map[string]int64
+	QueueDepth     map[string]int
 }
+
+// 哨兵错误：区分冻结锁内的重复写入与容量占满，锁外转换成可解释的 RejectError。
+var (
+	errDupInside      = errors.New("duplicate id inside freeze guard")
+	errCapacityLocked = errors.New("capacity fully occupied by frozen records")
+)
 
 // ledgerEntry 是 delivery.log 中的一行投递状态。
 type ledgerEntry struct {
@@ -78,7 +87,10 @@ type targetWorker struct {
 type Router struct {
 	engine *policy.Engine
 	store  *store.Store
+	hold   *freeze.Registry // 合规冻结注册表（可选；nil 时不启用冻结与容量硬判定）
 	cfg    Config
+
+	maxRetained int64 // 留存容量硬上限：被冻结记录占满后新写入以 capacity_locked 拒绝；<=0 不限制
 
 	mu        sync.Mutex // 保护 targets/seenIDs/stats
 	targets   map[string]*targetWorker
@@ -86,6 +98,7 @@ type Router struct {
 	received  int64
 	accepted  int64
 	rejected  int64
+	capLocked int64 // 因容量被冻结占满而拒绝的写入数
 	delivered map[string]int64
 	failed    map[string]int64
 	dropped   map[string]int64
@@ -116,6 +129,67 @@ func (r *Router) logf(format string, args ...any) {
 	if r.cfg.Logger != nil {
 		r.cfg.Logger.Printf(format, args...)
 	}
+}
+
+// WithFreeze 挂配合规冻结注册表与留存容量硬上限（须在 Start/Ingest 前调用）。
+// maxRetained>0 时：一旦被冻结记录数达到该上限，新写入将被以 capacity_locked
+// 显式拒绝（不会悄悄丢，也不会为腾地方删掉冻结记录）；普通超限仍由清理回收。
+func (r *Router) WithFreeze(hold *freeze.Registry, maxRetained int64) *Router {
+	r.hold = hold
+	r.maxRetained = maxRetained
+	return r
+}
+
+// FreezeRegistry 返回挂配的冻结注册表（未挂配返回 nil）。
+func (r *Router) FreezeRegistry() *freeze.Registry { return r.hold }
+
+// FreezeByIDs / UnfreezeByIDs / FreezeBySelector / UnfreezeBySelector
+// 是合规冻结操作的入口；操作与清理、写入共用冻结锁，结论逐条记入运行日志。
+func (r *Router) FreezeByIDs(ids []string) (*freeze.Report, error) {
+	rep, err := r.hold.FreezeByIDs(ids, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	r.logf("freeze by ids: action=%s changed=%d skipped=%d items=%d",
+		rep.Action, rep.Changed, rep.Skipped, len(rep.Items))
+	return rep, nil
+}
+
+func (r *Router) UnfreezeByIDs(ids []string) (*freeze.Report, error) {
+	rep, err := r.hold.UnfreezeByIDs(ids, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	r.logf("unfreeze by ids: action=%s changed=%d skipped=%d items=%d",
+		rep.Action, rep.Changed, rep.Skipped, len(rep.Items))
+	return rep, nil
+}
+
+func (r *Router) FreezeBySelector(sel freeze.Selector) (*freeze.Report, error) {
+	rep, err := r.hold.FreezeBySelector(sel, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	r.logf("freeze by selector: source=%q type=%q actor=%q from=%s to=%s ids=%d => changed=%d skipped=%d",
+		sel.Source, sel.Type, sel.Actor, fmtTime(sel.From), fmtTime(sel.To), len(sel.IDs), rep.Changed, rep.Skipped)
+	return rep, nil
+}
+
+func (r *Router) UnfreezeBySelector(sel freeze.Selector) (*freeze.Report, error) {
+	rep, err := r.hold.UnfreezeBySelector(sel, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	r.logf("unfreeze by selector: source=%q type=%q actor=%q from=%s to=%s ids=%d => changed=%d skipped=%d",
+		sel.Source, sel.Type, sel.Actor, fmtTime(sel.From), fmtTime(sel.To), len(sel.IDs), rep.Changed, rep.Skipped)
+	return rep, nil
+}
+
+func fmtTime(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // AddTarget 注册一个下游目标（须在 Start 前调用）。
@@ -253,17 +327,60 @@ func (r *Router) Ingest(ctx context.Context, ev event.Event) error {
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if _, dup := r.seenIDs[ev.ID]; dup {
 		r.rejected++
+		r.mu.Unlock()
 		r.logf("ingest rejected: id=%q reason=%s", ev.ID, event.RejectDuplicateID)
 		return &event.RejectError{Reason: event.RejectDuplicateID, Detail: "event id already ingested"}
 	}
+	r.mu.Unlock()
 
-	seq, err := r.store.Append(dec.Record)
-	if err != nil {
-		return fmt.Errorf("persist event: %w", err)
+	// 容量判定与落盘在冻结注册表互斥保护下完成：
+	// 与清理/冻结/解冻互不破坏，不会出现「判定可写、落盘时已被清」的竞态。
+	var seq int64
+	guardErr := freeze.Guard(r.hold, func() error {
+		// 再次确认重复（防止锁外检查后并发写入同 ID）。
+		if _, dup, lerr := r.store.LookupSeq(ev.ID); lerr != nil {
+			return lerr
+		} else if dup {
+			return errDupInside
+		}
+		if r.hold != nil && r.maxRetained > 0 {
+			frozenN := int64(r.hold.FrozenCountLocked())
+			count := r.store.Count()
+			if frozenN >= r.maxRetained {
+				// 容量被冻结记录占满：无法保证新记录不被挤出，显式拒绝。
+				r.mu.Lock()
+				r.capLocked++
+				r.mu.Unlock()
+				r.logf("ingest rejected: id=%q reason=%s frozen=%d cap=%d total=%d",
+					ev.ID, event.RejectCapacityLocked, frozenN, r.maxRetained, count)
+				return errCapacityLocked
+			}
+		}
+		var err error
+		seq, err = r.store.Append(dec.Record)
+		return err
+	})
+	if guardErr == errCapacityLocked {
+		r.mu.Lock()
+		r.rejected++
+		r.mu.Unlock()
+		return &event.RejectError{Reason: event.RejectCapacityLocked,
+			Detail: fmt.Sprintf("retention capacity %d fully occupied by frozen records; unfreeze or raise cap", r.maxRetained)}
 	}
+	if guardErr == errDupInside {
+		r.mu.Lock()
+		r.rejected++
+		r.mu.Unlock()
+		return &event.RejectError{Reason: event.RejectDuplicateID, Detail: "event id already ingested"}
+	}
+	if guardErr != nil {
+		return fmt.Errorf("persist event: %w", guardErr)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.seenIDs[ev.ID] = struct{}{}
 	r.accepted++
 	r.logf("ingest accepted: id=%q seq=%d policy=%s masked=%v targets=%v",
@@ -361,13 +478,14 @@ func (r *Router) Stats() Stats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	s := Stats{
-		Received:   r.received,
-		Accepted:   r.accepted,
-		Rejected:   r.rejected,
-		Delivered:  map[string]int64{},
-		Failed:     map[string]int64{},
-		Dropped:    map[string]int64{},
-		QueueDepth: map[string]int{},
+		Received:       r.received,
+		Accepted:       r.accepted,
+		Rejected:       r.rejected,
+		CapacityLocked: r.capLocked,
+		Delivered:      map[string]int64{},
+		Failed:         map[string]int64{},
+		Dropped:        map[string]int64{},
+		QueueDepth:     map[string]int{},
 	}
 	for name, w := range r.targets {
 		s.Delivered[name] = r.delivered[name]

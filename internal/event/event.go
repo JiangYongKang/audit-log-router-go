@@ -12,6 +12,7 @@ type Event struct {
 	ID        string            `json:"id"`
 	Type      string            `json:"type"`
 	Actor     string            `json:"actor"`
+	Source    string            `json:"source,omitempty"` // 事件来源（系统/通道标识），可用于合规冻结条件匹配
 	Timestamp time.Time         `json:"ts"`
 	Fields    map[string]string `json:"fields"`
 }
@@ -41,6 +42,9 @@ const (
 	RejectMissingRequired RejectReason = "missing_required_field"
 	RejectRuleConflict    RejectReason = "rule_conflict"
 	RejectDuplicateID     RejectReason = "duplicate_id"
+	// RejectCapacityLocked 表示留存容量已被合规冻结记录占满，新写入无法被保证保留。
+	// 与其他拒绝原因可区分：只有解冻或提高容量上限后才能恢复写入。
+	RejectCapacityLocked RejectReason = "capacity_locked"
 )
 
 // RejectError 携带被拒绝的原因与可读说明（说明中不得包含敏感原始值）。

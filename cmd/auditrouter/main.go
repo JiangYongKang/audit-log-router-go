@@ -16,6 +16,7 @@ import (
 
 	"github.com/highcumontoa/audit-log-router-go/internal/downstream"
 	"github.com/highcumontoa/audit-log-router-go/internal/event"
+	"github.com/highcumontoa/audit-log-router-go/internal/freeze"
 	"github.com/highcumontoa/audit-log-router-go/internal/policy"
 	"github.com/highcumontoa/audit-log-router-go/internal/retention"
 	"github.com/highcumontoa/audit-log-router-go/internal/router"
@@ -45,9 +46,19 @@ func main() {
 	}
 	defer st.Close()
 
+	// 合规冻结注册表：冻结状态独立 append-only 落盘（freeze.log），重启恢复。
+	hold, err := freeze.Open(*dir, st)
+	if err != nil {
+		logger.Fatalf("open freeze registry: %v", err)
+	}
+	defer hold.Close()
+
 	r := router.New(engine, st, router.Config{
 		QueueSize: 128, MaxRetries: 3, RetryBackoff: 20 * time.Millisecond, Logger: logger,
 	})
+	// 容量硬上限与 retention_count 对齐：冻结把容量占满时，新写入以
+	// capacity_locked 显式拒绝，而不是悄悄丢弃或挤掉冻结记录。
+	r.WithFreeze(hold, p.RetentionCount)
 	for _, name := range []string{"archive", "siem"} {
 		t, err := downstream.NewFileTarget(name, *dir+"/targets")
 		if err != nil {
@@ -62,7 +73,7 @@ func main() {
 	}
 
 	maxAge, _ := p.ParseAge()
-	sw := retention.New(st, time.Second, maxAge, p.RetentionCount, p.SegmentBytes)
+	sw := retention.New(st, time.Second, maxAge, p.RetentionCount, p.SegmentBytes).WithFreeze(hold)
 	sw.Start(ctx)
 	defer sw.Stop()
 
@@ -76,8 +87,8 @@ func main() {
 		logger.Printf("stop: %v", err)
 	}
 	s := r.Stats()
-	fmt.Printf("stats: received=%d accepted=%d rejected=%d delivered=%v dropped=%v queue=%v\n",
-		s.Received, s.Accepted, s.Rejected, s.Delivered, s.Dropped, s.QueueDepth)
+	fmt.Printf("stats: received=%d accepted=%d rejected=%d capacity_locked=%d delivered=%v dropped=%v queue=%v frozen=%d\n",
+		s.Received, s.Accepted, s.Rejected, s.CapacityLocked, s.Delivered, s.Dropped, s.QueueDepth, hold.FrozenCount())
 }
 
 func loadPolicy(path string) (*policy.Policy, error) {
@@ -121,4 +132,11 @@ func runDemo(ctx context.Context, r *router.Router, logger *log.Logger) {
 		}
 	}
 	time.Sleep(300 * time.Millisecond) // 等待投递循环
+
+	// 演示合规冻结：对已接收的 evt-1 加冻结（freeze.log 可核查，重启后仍在）。
+	if rep, err := r.FreezeByIDs([]string{"evt-1"}); err == nil {
+		logger.Printf("legal hold: changed=%d skipped=%d items=%+v", rep.Changed, rep.Skipped, rep.Items)
+	} else {
+		logger.Printf("legal hold: %v", err)
+	}
 }
