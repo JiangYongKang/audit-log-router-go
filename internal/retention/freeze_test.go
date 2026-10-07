@@ -38,7 +38,7 @@ func TestSweepSkipsFrozenSegments(t *testing.T) {
 
 	logger := log.New(testLogWriter{t}, "[retention-test] ", 0)
 	sw := New(st, time.Hour, 24*time.Hour, 1, 0) // 保留期+容量双重压力
-	sw.SetFreezeHook(reg.IsFrozen, logger)
+	sw.SetFreezeHook(reg, logger)
 	rep, err := sw.Sweep(context.Background(), now)
 	if err != nil {
 		t.Fatal(err)
@@ -77,7 +77,7 @@ func TestUnfreezeRestoresOriginalPurge(t *testing.T) {
 		t.Fatal(err)
 	}
 	sw := New(st, time.Hour, 24*time.Hour, 0, 0)
-	sw.SetFreezeHook(reg.IsFrozen, nil)
+	sw.SetFreezeHook(reg, nil)
 
 	// 冻结中：超期段被保留。
 	rep, _ := sw.Sweep(context.Background(), now)
@@ -115,7 +115,7 @@ func TestSweepCapacityUnreclaimableWhenFrozen(t *testing.T) {
 	}
 	logger := log.New(testLogWriter{t}, "[retention-test] ", 0)
 	sw := New(st, time.Hour, 0, 3, 0)
-	sw.SetFreezeHook(reg.IsFrozen, logger)
+	sw.SetFreezeHook(reg, logger)
 	rep, err := sw.Sweep(context.Background(), now)
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +163,7 @@ func TestFreezeRestartKeepsSameSweepDecision(t *testing.T) {
 	}
 	defer reg2.Close()
 	sw := New(st, time.Hour, 24*time.Hour, 0, 0)
-	sw.SetFreezeHook(reg2.IsFrozen, nil)
+	sw.SetFreezeHook(reg2, nil)
 	rep, err := sw.Sweep(context.Background(), now)
 	if err != nil {
 		t.Fatal(err)
@@ -182,13 +182,14 @@ func TestFreezeRestartKeepsSameSweepDecision(t *testing.T) {
 }
 
 // 冻结/解冻/写入/清理并发进行：任何时刻处于冻结态的记录都不得被清理，
-// 计数自洽（Count 与扫描一致、无重复）。
+// 计数自洽（Count 与扫描一致、无重复），并且冻结集合始终是现存记录的子集
+// （不允许「冻结状态查得到、留存数据已删除」的矛盾结论）。
 func TestConcurrentFreezeSweepAppend(t *testing.T) {
 	st, _ := store.Open(t.TempDir())
 	defer st.Close()
 	reg := newFreezeRegistry(t)
 	sw := New(st, time.Millisecond, 0, 60, 1) // 小容量+小段，频繁轮转与挤出
-	sw.SetFreezeHook(reg.IsFrozen, nil)
+	sw.SetFreezeHook(reg, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -201,7 +202,10 @@ func TestConcurrentFreezeSweepAppend(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; i < 60; i++ {
-				st.Append(mkRecAt(fmt.Sprintf("w%d-%d", w, i), time.Now()))
+				if _, err := st.Append(mkRecAt(fmt.Sprintf("w%d-%d", w, i), time.Now())); err != nil {
+					t.Errorf("append: %v", err)
+					return
+				}
 			}
 		}(w)
 	}
@@ -211,13 +215,30 @@ func TestConcurrentFreezeSweepAppend(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < 40; i++ {
 			id := fmt.Sprintf("w0-%d", i%30)
-			reg.FreezeIDs(st, id)
+			rep, err := reg.FreezeIDs(st, id)
+			if err != nil {
+				t.Errorf("freeze %s: %v", id, err)
+				return
+			}
+			// 成功冻结的 ID 必须是现存记录（真正的关键不变量由清理循环校验）；
+			// Skipped 可能是「已被清理」或「尚未写入」，二者都合法。
+			for _, ch := range rep.Changed {
+				if !recordExists(st, ch) {
+					t.Errorf("freeze reports %s changed but record missing", ch)
+					return
+				}
+			}
 			if i%3 == 0 {
-				reg.UnfreezeIDs(id)
+				if _, err := reg.UnfreezeIDs(id); err != nil {
+					t.Errorf("unfreeze %s: %v", id, err)
+					return
+				}
 			}
 		}
 	}()
-	// 并发清理：每次清理后，当前冻结的记录必须全部存活。
+	// 并发清理：每次清理后做一次原子一致性校验（store 锁 + 冻结锁，锁序
+	// store -> freeze）：当前冻结的记录必须全部存活、计数一致、无重复，
+	// 且冻结集合是现存数据的子集（不允许「冻结状态查得到、留存数据已删除」）。
 	var sweepErr error
 	var smu sync.Mutex
 	sweepDone := make(chan struct{})
@@ -225,18 +246,20 @@ func TestConcurrentFreezeSweepAppend(t *testing.T) {
 		defer close(sweepDone)
 		for ctx.Err() == nil {
 			if _, err := sw.Sweep(ctx, time.Now()); err != nil {
+				// 停止信号导致的取消是正常退出，不是清理失败。
+				if ctx.Err() != nil {
+					return
+				}
 				smu.Lock()
 				sweepErr = err
 				smu.Unlock()
 				return
 			}
-			for _, id := range reg.FrozenIDs() {
-				if !recordExists(st, id) {
-					smu.Lock()
-					sweepErr = fmt.Errorf("frozen record %s was purged", id)
-					smu.Unlock()
-					return
-				}
+			if err := assertStateConsistent(st, reg); err != nil {
+				smu.Lock()
+				sweepErr = err
+				smu.Unlock()
+				return
 			}
 			time.Sleep(time.Millisecond)
 		}
@@ -251,28 +274,54 @@ func TestConcurrentFreezeSweepAppend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 终态自洽：Count 与扫描一致、无重复；仍冻结的记录全部存活。
-	recs, err := st.ScanSeqs(context.Background(), 0, 0)
-	if err != nil {
+	// 终态再做一次完整自洽校验。
+	if err := assertStateConsistent(st, reg); err != nil {
 		t.Fatal(err)
 	}
-	if int64(len(recs)) != st.Count() {
-		t.Fatalf("count mismatch: scan=%d Count=%d", len(recs), st.Count())
+	// 此时所有 worker 已停止：冻结计数与 ID 集合数量必须一致（计数不漂移）。
+	if int64(reg.FrozenCount()) != int64(len(reg.FrozenIDs())) {
+		t.Fatalf("freeze count drift: FrozenCount=%d len(FrozenIDs)=%d",
+			reg.FrozenCount(), len(reg.FrozenIDs()))
 	}
-	seen := map[string]bool{}
-	for _, r := range recs {
-		if seen[r.ID] {
-			t.Fatalf("duplicate after concurrent freeze/sweep: %s", r.ID)
-		}
-		seen[r.ID] = true
-	}
-	for _, id := range reg.FrozenIDs() {
-		if !seen[id] {
-			t.Fatalf("frozen record %s missing at end", id)
-		}
-	}
-	t.Logf("判定依据: 并发冻结/清理/写入后 count=%d 无重复, 冻结中的 %d 条全部存活",
+	t.Logf("判定依据: 并发冻结/清理/写入后 count=%d 无重复, 冻结中的 %d 条全部存活且与留存数据一致",
 		st.Count(), reg.FrozenCount())
+}
+
+// assertStateConsistent 在同一把 store 临界区内、并全程持有冻结锁快照地校验
+// （锁序 store -> freeze）：
+//  1. 扫描记录数与 store.Count 一致（计数不漂移、无丢数据）；
+//  2. 记录 ID 无重复；
+//  3. 每个处于冻结态的 ID 都在现存记录中（冻结状态与留存数据不自相矛盾）。
+//
+// 两把锁同时持有期间：冻结/解冻无法插入（冻结锁），清理删除/轮转无法插入
+// （store 锁），所以「冻结集合 ⊆ 现存记录」是在一个真实的联合原子视图上判定的。
+// 注意回调内不得再调用 Registry 的任何加锁方法（Go 互斥锁不可重入）。
+func assertStateConsistent(st *store.Store, reg *freeze.Registry) error {
+	return st.RunLocked(func() error {
+		return reg.WithSnapshot(func(frozen map[string]struct{}) error {
+			recs, err := st.ScanSeqsLocked(context.Background(), 0, 0)
+			if err != nil {
+				return err
+			}
+			cnt := st.CountLocked()
+			if int64(len(recs)) != cnt {
+				return fmt.Errorf("count drift: scan=%d Count=%d", len(recs), cnt)
+			}
+			existing := make(map[string]bool, len(recs))
+			for _, r := range recs {
+				if existing[r.ID] {
+					return fmt.Errorf("duplicate record %s after concurrent sweep", r.ID)
+				}
+				existing[r.ID] = true
+			}
+			for id := range frozen {
+				if !existing[id] {
+					return fmt.Errorf("contradiction: frozen record %s no longer exists in store", id)
+				}
+			}
+			return nil
+		})
+	})
 }
 
 func recordExists(st *store.Store, id string) bool {

@@ -85,10 +85,32 @@ freeze.Registry：合规冻结（legal hold），freeze.log 持久化，重启�
   不改变计数；每次操作返回 `Report{Changed, Skipped}`，只列实际改变状态的记录。
 - **持久化**：所有实际改变集合的操作追加到 `<dir>/freeze.log` 并 fsync；重启重放恢复，
   半写行在 Open 时截断。重启前后对同一批记录的清理结论一致。
+- **与清理并发时的原子约定（核心）**：冻结/解冻与后台清理可能在任意时刻交错，
+  系统用统一锁序与原子临界区保证结论永远自洽：
+  - 固定锁序 **store 锁 → freeze 锁**，全代码库无反向获取，杜绝死锁；
+  - 一次清理的「取冻结集合快照 → 逐段冻结判定 → 超期/容量标记 → 删除段」（含必要的
+    活动段轮转）全程在同一个 store 临界区、同一份冻结快照内完成；
+  - 「按 ID/按条件冻结」把**存在性扫描 + 集合变更（含 fsync）**放进同一个 store 临界区。
+  - 因此对任意一条记录，「冻结」与「清理」只有两种确定结果，不会再有第三种矛盾结果：
+    1. **冻结先提交** → 本次清理判定时它已冻结，其所在段（保留期与容量两个阶段）整体
+       跳过，记录在解冻前**一定保留且可查**；
+    2. **清理先提交** → 记录已不在留存中，随后的冻结在同一临界区扫描时查不到它，
+       计入 `Report.Skipped`，不会留下「冻结状态查得到、留存数据已删除」的悬挂状态。
+  - 不会出现同一条记录「既被当成已清理、又被当成冻结保留」的自相矛盾；
+    重复冻结/解冻仍是 no-op，`FrozenCount` 与 `FrozenIDs` 不重复、不漂移。
+- **写盘失败的原子性**：freeze.log 写入或 fsync 失败时，冻结/解冻操作返回错误且
+  **内存集合不变更**——进程绝不带着「未持久化的冻结/解冻」继续运行，重启后结论
+  必然与 freeze.log 完全一致。
+- **中断/出错安全**：清理在执行前或执行中被 `context` 取消时**零删除**，
+  状态与取消前完全一致，不会顺手删掉冻结段；段删除中途若文件系统出错，已确认删除
+  的段保持删除（计入报告），未能确认删除的段与后续段原样保留，冻结记录不受影响。
+- **解冻后重新参与清理**：解冻本身不删除任何数据（不会一解冻就丢）；下一次清理按
+  原来的保留期/容量规则处理已解冻的段（也不会解冻后永远清不掉）。
 - **与留存的关系**：清理以段为单位——**段内含任意一条冻结记录，该段整体跳过**
   （保留期与容量两个阶段都跳过），跳过的段写入 `PurgeReport.Reason`
-  （`kept_frozen_segments=...`）并打印运行日志。解冻本身不删除任何数据；
-  下一次清理按原保留期/容量规则处理已解冻的段。
+  （`kept_frozen_segments=...`）并打印运行日志。冻结判定、段删除与活动段轮转在
+  同一 store 临界区内完成，因此「段刚被判为可删、里面的记录此刻被冻结」这类交错
+  不可能产生删除；解冻本身不删除任何数据；下一次清理按原保留期/容量规则处理已解冻的段。
 - **与容量的关系**（确定性行为）：
   - 冻结记录永不因容量压力被挤掉；容量清理只从「不含冻结记录的封存段」中回收；
   - 若冻结占用导致无法回收到上限以下，清理报告给出 `capacity_unreclaimable:...`
@@ -103,9 +125,18 @@ freeze.Registry：合规冻结（legal hold），freeze.log 持久化，重启�
 
 ```bash
 go vet ./...
-go test ./... -race -count=1      # 单元 + 故障注入/并发/重启集成测试
+# 单元 + 故障注入/并发/重启集成测试；重复多次 + 竞态检测，应稳定全绿：
+go test ./... -race -count=1
+go test ./internal/retention ./internal/router ./internal/freeze -race -count=10
+# 查看每个用例的判定依据与结果（业务覆盖一目了然）：
+go test ./internal/retention -race -v
 go test ./internal/router -race -v
+go test ./internal/freeze -race -v
 ```
+
+并发用例每个回合都在「冻结集合 ⊆ 现存记录、扫描计数 == 存储计数、无重复 ID、
+冻结计数不漂移」的原子联合视图上断言，因此能稳定抓住「刚冻结就被清走」「计数漂移」
+等交错问题，而不是时好时坏。
 
 关键测试（日志中打印判定依据）：
 
@@ -125,6 +156,12 @@ go test ./internal/router -race -v
 | `TestSweepSkipsFrozenSegments` / `TestUnfreezeRestoresOriginalPurge` | 冻结段跳过清理；解冻后按原规则参与清理 |
 | `TestSweepCapacityUnreclaimableWhenFrozen` | 容量被冻结占满时的确定结论，冻结记录不被挤掉 |
 | `TestConcurrentFreezeSweepAppend` | 冻结/解冻/写入/清理并发，冻结记录不丢、计数自洽 |
+| `TestConcurrentFreezeCriteriaSweepAgePressure` | 超期+容量清理 与 按ID/按条件冻结解冻 高并发，冻结集合始终是现存记录子集 |
+| `TestSweepCanceledIsAtomicNoDeletion` | 清理被取消时零删除、冻结段与冻结状态不受影响 |
+| `TestSweepBehaviorIdenticalWhenHookNotSet` | 未接线冻结钩子时清理结果与无冻结基线完全一致 |
+| `TestUnfreezeAfterChurnRejoinsPurge` | 并发结束后解冻的段重新按原保留期规则回收，仍冻结的保留 |
+| `TestConcurrentIngestFreezeSweep` | 写入(带容量门控)/投递/冻结解冻/清理端到端并发，不死锁、拒绝原因可区分、解冻回收后写入恢复 |
+| `TestApplyWriteFailureLeavesStateUnchanged` / `TestFailedOperationDoesNotSurviveRestart` | freeze.log 写失败时内存集合不变更；未持久化的冻结在重启后不存在 |
 | `TestIngestRejectedWhenCapacityFrozen` / `TestIngestUnaffectedWithoutCapacityGate` | 容量门控拒绝可区分；无门控时行为不变 |
 
 示例程序：

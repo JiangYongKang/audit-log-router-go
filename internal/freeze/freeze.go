@@ -9,7 +9,16 @@
 // 不重复写日志、不重复计数。
 //
 // 锁序约定：允许 store 锁 -> freeze 锁；禁止 freeze 锁 -> store 锁。
-// 因此所有按条件/按 ID 操作都先扫描 store（不持有 freeze 锁），再变更集合。
+//
+// 因此所有需要核对「记录是否仍存在」的操作（按 ID/按条件冻结、按条件解冻）
+// 都通过 store.RunLocked 把「扫描存在性 + 变更冻结集（含 fsync）」放进同一把
+// store 临界区；清理侧同样在该临界区内完成「冻结判定 + 删除段」。
+// 于是冻结与清理对同一条记录的结论只有两种可能：
+//
+//	冻结先于清理提交 → 清理判定时已冻结，段保留；
+//	清理先于冻结提交 → 记录已不存在，冻结的存在性扫描查不到它（计入 Skipped）。
+//
+// 绝不会出现「冻结状态里有、留存数据里已删除」的矛盾结论。
 package freeze
 
 import (
@@ -167,6 +176,23 @@ func (r *Registry) FrozenCount() int {
 func (r *Registry) FrozenIDs() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.sortedIDsLocked()
+}
+
+// WithSnapshot 在持有冻结锁期间，对当前冻结集合的一份拷贝执行 fn。
+// 清理流程可把该调用放在 store.RunLocked 临界区内（锁序 store -> freeze），
+// 从而保证一次清理的全部判定与删除期间冻结集合不发生变化。
+func (r *Registry) WithSnapshot(fn func(frozen map[string]struct{}) error) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	snap := make(map[string]struct{}, len(r.frozen))
+	for id := range r.frozen {
+		snap[id] = struct{}{}
+	}
+	return fn(snap)
+}
+
+func (r *Registry) sortedIDsLocked() []string {
 	out := make([]string, 0, len(r.frozen))
 	for id := range r.frozen {
 		out = append(out, id)
@@ -176,97 +202,143 @@ func (r *Registry) FrozenIDs() []string {
 }
 
 // FreezeIDs 按事件标识冻结记录；未在 store 中找到的 ID 计入 Skipped。
+//
+// 「存在性核对 + 集合变更」在同一把 store 临界区内完成：若记录此刻已被清理，
+// 它不会进入冻结集合（避免冻结状态指向不存在的数据）；反之一旦冻结提交成功，
+// 同临界区协议保证任何后续清理都必须跳过它。
 func (r *Registry) FreezeIDs(st *store.Store, ids ...string) (*Report, error) {
-	existing, err := scanIDSet(st)
+	rep := &Report{Op: "freeze"}
+	err := st.RunLocked(func() error {
+		existing, err := scanIDSetLocked(st)
+		if err != nil {
+			return err
+		}
+		var candidates []string
+		for _, id := range ids {
+			if existing[id] {
+				candidates = append(candidates, id)
+			} else {
+				rep.Skipped = append(rep.Skipped, id)
+			}
+		}
+		changed, _, err := r.apply(logEntry{Op: "freeze", Ts: time.Now()}, candidates)
+		if err != nil {
+			return err
+		}
+		rep.Changed = changed
+		sort.Strings(rep.Skipped)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	rep := &Report{Op: "freeze"}
-	var candidates []string
-	for _, id := range ids {
-		if existing[id] {
-			candidates = append(candidates, id)
-		} else {
-			rep.Skipped = append(rep.Skipped, id)
-		}
-	}
-	rep.Changed = r.apply(logEntry{Op: "freeze", Ts: time.Now()}, candidates)
-	sort.Strings(rep.Skipped)
 	return rep, nil
 }
 
 // UnfreezeIDs 按事件标识解冻记录；未处于冻结态的 ID 计入 Skipped。
+// 解冻不需要核对 store 中的存在性（被解冻目标只可能是已冻结的现存记录；
+// 在本锁序协议下，已删除记录不可能留在冻结集合中）。
 func (r *Registry) UnfreezeIDs(ids ...string) (*Report, error) {
 	rep := &Report{Op: "unfreeze"}
-	r.mu.Lock()
-	for _, id := range ids {
-		if _, ok := r.frozen[id]; !ok {
-			rep.Skipped = append(rep.Skipped, id)
-		}
+	changed, skipped, err := r.apply(logEntry{Op: "unfreeze", Ts: time.Now()}, ids)
+	if err != nil {
+		return nil, err
 	}
-	r.mu.Unlock()
-	rep.Changed = r.apply(logEntry{Op: "unfreeze", Ts: time.Now()}, ids)
+	rep.Changed = changed
+	rep.Skipped = skipped
 	sort.Strings(rep.Skipped)
 	return rep, nil
 }
 
 // FreezeByCriteria 按条件批量冻结 store 中匹配的记录。
 // 空条件返回 ErrEmptyCriteria，拒绝执行。
+// 扫描匹配与集合变更在同一把 store 临界区内完成，与清理互斥。
 func (r *Registry) FreezeByCriteria(st *store.Store, c Criteria) (*Report, error) {
 	if c.IsZero() {
 		return nil, ErrEmptyCriteria
 	}
-	matched, err := scanMatching(st, c)
+	rep := &Report{Op: "freeze", Criteria: &c}
+	err := st.RunLocked(func() error {
+		matched, err := scanMatchingLocked(st, c)
+		if err != nil {
+			return err
+		}
+		changed, _, err := r.apply(logEntry{Op: "freeze", Criteria: &c, Ts: time.Now()}, matched)
+		if err != nil {
+			return err
+		}
+		rep.Changed = changed
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	rep := &Report{Op: "freeze", Criteria: &c}
-	rep.Changed = r.apply(logEntry{Op: "freeze", Criteria: &c, Ts: time.Now()}, matched)
 	return rep, nil
 }
 
 // UnfreezeByCriteria 按条件批量解冻 store 中匹配且已冻结的记录。
 // 空条件返回 ErrEmptyCriteria，拒绝执行。
+// 同样在 store 临界区内完成，保证「扫描到的记录集」与「解冻变更」之间
+// 不会插入段删除。
 func (r *Registry) UnfreezeByCriteria(st *store.Store, c Criteria) (*Report, error) {
 	if c.IsZero() {
 		return nil, ErrEmptyCriteria
 	}
-	matched, err := scanMatching(st, c)
+	rep := &Report{Op: "unfreeze", Criteria: &c}
+	err := st.RunLocked(func() error {
+		matched, err := scanMatchingLocked(st, c)
+		if err != nil {
+			return err
+		}
+		changed, _, err := r.apply(logEntry{Op: "unfreeze", Criteria: &c, Ts: time.Now()}, matched)
+		if err != nil {
+			return err
+		}
+		rep.Changed = changed
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	rep := &Report{Op: "unfreeze", Criteria: &c}
-	rep.Changed = r.apply(logEntry{Op: "unfreeze", Criteria: &c, Ts: time.Now()}, matched)
 	return rep, nil
 }
 
-// apply 在集合上应用一次操作：只挑实际改变状态的 ID，写日志（fsync）后变更集合。
-// 幂等：已处于目标状态的 ID 是 no-op，不写日志、不计数。
-func (r *Registry) apply(le logEntry, ids []string) []string {
+// apply 在集合上应用一次操作：只挑实际改变状态的 ID，写日志（fsync）成功后
+// 才变更内存集合。幂等：已处于目标状态的 ID 是 no-op，不写日志、不计数；
+// 解冻时这类 ID 计入 skipped 返回给调用方。
+//
+// 若日志写入或 fsync 失败，返回错误且内存集合保持不变——进程不会带着
+// 「未持久化的冻结/解冻」继续运行，重启后的结论必然与 freeze.log 一致。
+func (r *Registry) apply(le logEntry, ids []string) (changed []string, skipped []string, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var changed []string
 	for _, id := range ids {
 		_, frozen := r.frozen[id]
-		if le.Op == "freeze" && !frozen {
+		switch {
+		case le.Op == "freeze" && !frozen:
 			changed = append(changed, id)
-		}
-		if le.Op == "unfreeze" && frozen {
+		case le.Op == "unfreeze" && !frozen:
+			skipped = append(skipped, id)
+		case le.Op == "unfreeze" && frozen:
 			changed = append(changed, id)
 		}
 	}
 	if len(changed) == 0 {
-		return nil
+		sort.Strings(skipped)
+		return nil, skipped, nil
 	}
 	sort.Strings(changed)
 	le.IDs = changed
 	b, err := json.Marshal(le)
 	if err != nil {
-		return nil // 不可达：结构固定可编码
+		return nil, nil, err // 不可达：结构固定可编码
 	}
 	if r.log != nil {
-		if _, err := r.log.Write(append(b, '\n')); err == nil {
-			r.log.Sync()
+		if _, err := r.log.Write(append(b, '\n')); err != nil {
+			return nil, nil, fmt.Errorf("write %s log: %w", le.Op, err)
+		}
+		if err := r.log.Sync(); err != nil {
+			return nil, nil, fmt.Errorf("fsync %s log: %w", le.Op, err)
 		}
 	}
 	for _, id := range changed {
@@ -276,12 +348,13 @@ func (r *Registry) apply(le logEntry, ids []string) []string {
 			delete(r.frozen, id)
 		}
 	}
-	return changed
+	return changed, skipped, nil
 }
 
-// scanIDSet 扫描 store 中现存记录 ID（不持有 freeze 锁，遵守锁序）。
-func scanIDSet(st *store.Store) (map[string]bool, error) {
-	recs, err := st.ScanSeqs(context.Background(), 0, 0)
+// scanIDSetLocked 扫描 store 中现存记录 ID。调用方必须已通过
+// store.RunLocked 持有存储锁（遵守锁序 store -> freeze）。
+func scanIDSetLocked(st *store.Store) (map[string]bool, error) {
+	recs, err := st.ScanSeqsLocked(context.Background(), 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -292,9 +365,9 @@ func scanIDSet(st *store.Store) (map[string]bool, error) {
 	return out, nil
 }
 
-// scanMatching 扫描 store 中命中条件的记录 ID（不持有 freeze 锁，遵守锁序）。
-func scanMatching(st *store.Store, c Criteria) ([]string, error) {
-	recs, err := st.ScanSeqs(context.Background(), 0, 0)
+// scanMatchingLocked 扫描 store 中命中条件的记录 ID。调用方必须已持有存储锁。
+func scanMatchingLocked(st *store.Store, c Criteria) ([]string, error) {
+	recs, err := st.ScanSeqsLocked(context.Background(), 0, 0)
 	if err != nil {
 		return nil, err
 	}

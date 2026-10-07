@@ -64,7 +64,7 @@ func TestIngestRejectedWhenCapacityFrozen(t *testing.T) {
 		t.Fatal(err)
 	}
 	sw := retention.New(f.st, time.Hour, 0, 2, 0)
-	sw.SetFreezeHook(reg.IsFrozen, nil)
+	sw.SetFreezeHook(reg, nil)
 	rep, err := sw.Sweep(ctx, time.Now())
 	if err != nil {
 		t.Fatal(err)

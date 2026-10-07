@@ -78,10 +78,10 @@ func TestFreezeUnfreezeByID(t *testing.T) {
 func TestFreezeByCriteriaBoundaries(t *testing.T) {
 	base := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 	st := openStoreWith(t, []event.Record{
-		mkRecAt("edge-from", "alice", "login", base),                 // From 边界（含）
-		mkRecAt("edge-to", "alice", "login", base.Add(2*time.Hour)),  // To 边界（含）
-		mkRecAt("inside", "alice", "login", base.Add(time.Hour)),     // 区间内
-		mkRecAt("before", "alice", "login", base.Add(-time.Second)),  // 区间外（早1s）
+		mkRecAt("edge-from", "alice", "login", base),                          // From 边界（含）
+		mkRecAt("edge-to", "alice", "login", base.Add(2*time.Hour)),           // To 边界（含）
+		mkRecAt("inside", "alice", "login", base.Add(time.Hour)),              // 区间内
+		mkRecAt("before", "alice", "login", base.Add(-time.Second)),           // 区间外（早1s）
 		mkRecAt("after", "alice", "login", base.Add(2*time.Hour+time.Second)), // 区间外（晚1s）
 		mkRecAt("wrong-type", "alice", "logout", base.Add(time.Hour)),         // 类型不符
 		mkRecAt("wrong-actor", "bob", "login", base.Add(time.Hour)),           // 来源不符

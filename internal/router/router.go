@@ -12,6 +12,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -243,8 +244,14 @@ func (r *Router) Stop(ctx context.Context) error {
 	return nil
 }
 
-// Ingest 采集一条事件：校验 -> 脱敏 -> 落盘 -> 逐目标入队。
-// 任一环节失败都返回带可区分原因的错误。
+// Ingest 采集一条事件：校验 -> 去重 -> 容量门控+落盘 -> 逐目标入队。
+//
+// 锁序约定（关键，避免与后台清理/投递形成死锁环）：
+//
+//	router.mu 永远不跨 store 操作持有。落盘与容量门控只在 store 临界区内完成
+//	（store 内可取冻结锁，锁序 store -> freeze）；router.mu 只在更新
+//	seenIDs/计数/入队时短暂持有。投递 worker 的锁序是 store(被清理临界区阻塞时)
+//	-> router.mu，因此与本路径方向一致（永远是先 store 后 router.mu 或只取其一）。
 func (r *Router) Ingest(ctx context.Context, ev event.Event) error {
 	r.mu.Lock()
 	r.received++
@@ -259,38 +266,40 @@ func (r *Router) Ingest(ctx context.Context, ev event.Event) error {
 		return &event.RejectError{Reason: dec.Reason, Detail: dec.Detail}
 	}
 
+	// 去重检查与「预留 ID」在 router.mu 内原子完成；随后立即释放，
+	// 再去做需要 fsync 的 store 操作（router.mu 不跨 store）。
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if _, dup := r.seenIDs[ev.ID]; dup {
 		r.rejected++
+		r.mu.Unlock()
 		r.logf("ingest rejected: id=%q reason=%s", ev.ID, event.RejectDuplicateID)
 		return &event.RejectError{Reason: event.RejectDuplicateID, Detail: "event id already ingested"}
 	}
+	r.seenIDs[ev.ID] = struct{}{} // 先预留，落盘失败时回滚
+	r.mu.Unlock()
 
-	// 容量门控：达到上限且无可回收段（冻结占用或仅有活动段）时明确拒绝。
-	if r.cfg.MaxCount > 0 && r.store.Count() >= r.cfg.MaxCount {
-		reclaim, err := r.store.ReclaimableCount(r.cfg.IsFrozen)
-		if err != nil {
-			return fmt.Errorf("check reclaimable capacity: %w", err)
-		}
-		if reclaim == 0 {
+	// 容量门控 + 落盘是一个 store 原子临界区：门控通过与追加之间不会插入清理。
+	seq, err := r.store.AppendGated(dec.Record, r.capacityGate)
+	if err != nil {
+		r.mu.Lock()
+		delete(r.seenIDs, ev.ID) // 落盘失败：回滚预留，允许同 ID 重试
+		if errors.Is(err, store.ErrCapacityRejected) {
 			r.rejected++
+			r.mu.Unlock()
 			detail := fmt.Sprintf("retention count %d reached and no reclaimable segment (capacity held by frozen records or active segment)",
 				r.cfg.MaxCount)
 			r.logf("ingest rejected: id=%q reason=%s detail=%q", ev.ID, event.RejectCapacityFrozen, detail)
 			return &event.RejectError{Reason: event.RejectCapacityFrozen, Detail: detail}
 		}
-	}
-
-	seq, err := r.store.Append(dec.Record)
-	if err != nil {
+		r.mu.Unlock()
 		return fmt.Errorf("persist event: %w", err)
 	}
-	r.seenIDs[ev.ID] = struct{}{}
+
+	// 落盘成功后，短暂持 router.mu 更新记账并入队。
+	r.mu.Lock()
 	r.accepted++
 	r.logf("ingest accepted: id=%q seq=%d policy=%s masked=%v targets=%v",
 		ev.ID, seq, dec.Record.PolicyVersion, dec.Record.Masked, dec.Targets)
-
 	for _, name := range dec.Targets {
 		w, ok := r.targets[name]
 		if !ok {
@@ -307,6 +316,27 @@ func (r *Router) Ingest(ctx context.Context, ev event.Event) error {
 			r.dropped[name]++
 			r.logf("delivery dropped: id=%q target=%q reason=backlog_full", ev.ID, name)
 		}
+	}
+	r.mu.Unlock()
+	return nil
+}
+
+// capacityGate 在 store 临界区内执行容量判定（允许内部调用冻结钩子，
+// 锁序 store -> freeze）。达到上限且没有可回收封存段时返回
+// store.ErrCapacityRejected；MaxCount=0 表示门控关闭（行为不变）。
+func (r *Router) capacityGate() error {
+	if r.cfg.MaxCount <= 0 {
+		return nil
+	}
+	if r.store.CountLocked() < r.cfg.MaxCount {
+		return nil
+	}
+	reclaim, err := r.store.ReclaimableCountLocked(r.cfg.IsFrozen)
+	if err != nil {
+		return err
+	}
+	if reclaim == 0 {
+		return store.ErrCapacityRejected
 	}
 	return nil
 }

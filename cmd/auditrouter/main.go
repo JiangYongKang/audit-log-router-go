@@ -72,7 +72,7 @@ func main() {
 
 	maxAge, _ := p.ParseAge()
 	sw := retention.New(st, time.Second, maxAge, p.RetentionCount, p.SegmentBytes)
-	sw.SetFreezeHook(fr.IsFrozen, logger)
+	sw.SetFreezeHook(fr, logger)
 	sw.Start(ctx)
 	defer sw.Stop()
 
