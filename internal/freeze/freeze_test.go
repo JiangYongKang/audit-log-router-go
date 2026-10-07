@@ -197,3 +197,46 @@ func TestScanSeqsUnaffectedByFreeze(t *testing.T) {
 		t.Fatalf("freeze must not alter stored records: n=%d err=%v", len(got), err)
 	}
 }
+
+// 记录在冻结生效前已被清理：冻结不得生效（计入 Skipped），
+// 保证不会出现「冻结状态里查得到、留存数据里找不到」的记录。
+func TestFreezePurgedRecordIsSkipped(t *testing.T) {
+	st := openStoreWith(t, []event.Record{
+		mkRecAt("gone", "alice", "login", time.Now()),
+		mkRecAt("stay", "bob", "login", time.Now()),
+	})
+	if err := st.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+	// 清掉含 gone/stay 的封存段（模拟清理先于冻结生效）。
+	segs := st.Segments()
+	if _, err := st.DeleteSegments([]int{segs[0].Index}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	reg, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	rep, err := reg.FreezeIDs(st, "gone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Changed) != 0 || len(rep.Skipped) != 1 || rep.Skipped[0] != "gone" {
+		t.Fatalf("purged record must not be frozen: %+v", rep)
+	}
+	if reg.IsFrozen("gone") || reg.FrozenCount() != 0 {
+		t.Fatalf("purged record must not enter frozen set: %v", reg.FrozenIDs())
+	}
+
+	// 按条件冻结同样如此：gone 命中条件但已不存在，不得进入冻结集合。
+	crep, err := reg.FreezeByCriteria(st, Criteria{Actor: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(crep.Changed) != 0 || reg.FrozenCount() != 0 {
+		t.Fatalf("criteria freeze of purged record must be no-op: %+v", crep)
+	}
+	t.Log("判定依据: 冻结生效前复核存在性, 已清理记录计入 Skipped 且不进冻结集合")
+}

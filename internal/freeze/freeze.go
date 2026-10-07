@@ -9,7 +9,9 @@
 // 不重复写日志、不重复计数。
 //
 // 锁序约定：允许 store 锁 -> freeze 锁；禁止 freeze 锁 -> store 锁。
-// 因此所有按条件/按 ID 操作都先扫描 store（不持有 freeze 锁），再变更集合。
+// 按条件/按 ID 操作先扫描 store（不持有 freeze 锁），再在 store 锁内
+// （store.ApplyUnderLock）复核记录存在性并变更集合——冻结生效与段删除
+// 互斥，并发清理不可能清走已冻结的记录，也不可能让已清走的记录进入冻结集合。
 package freeze
 
 import (
@@ -176,6 +178,10 @@ func (r *Registry) FrozenIDs() []string {
 }
 
 // FreezeIDs 按事件标识冻结记录；未在 store 中找到的 ID 计入 Skipped。
+//
+// 与清理的互斥：集合变更在 store 锁内生效（ApplyUnderLock），生效前复核
+// ID 是否仍存在——扫描之后、生效之前被清理掉的记录不会进入冻结集合，
+// 而是计入 Skipped，保证「冻结状态可查」与「留存可查」永不互相矛盾。
 func (r *Registry) FreezeIDs(st *store.Store, ids ...string) (*Report, error) {
 	existing, err := scanIDSet(st)
 	if err != nil {
@@ -190,7 +196,27 @@ func (r *Registry) FreezeIDs(st *store.Store, ids ...string) (*Report, error) {
 			rep.Skipped = append(rep.Skipped, id)
 		}
 	}
-	rep.Changed = r.apply(logEntry{Op: "freeze", Ts: time.Now()}, candidates)
+	le := logEntry{Op: "freeze", Ts: time.Now()}
+	err = st.ApplyUnderLock(func(v store.LockedView) error {
+		// 锁内复核：候选 ID 在扫描后可能已被清理，只冻结仍存在的。
+		still, verr := v.HasIDs(candidates)
+		if verr != nil {
+			return verr
+		}
+		var alive []string
+		for _, id := range candidates {
+			if still[id] {
+				alive = append(alive, id)
+			} else {
+				rep.Skipped = append(rep.Skipped, id)
+			}
+		}
+		rep.Changed = r.apply(le, alive)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	sort.Strings(rep.Skipped)
 	return rep, nil
 }
@@ -212,6 +238,8 @@ func (r *Registry) UnfreezeIDs(ids ...string) (*Report, error) {
 
 // FreezeByCriteria 按条件批量冻结 store 中匹配的记录。
 // 空条件返回 ErrEmptyCriteria，拒绝执行。
+// 与 FreezeIDs 相同：集合变更在 store 锁内生效并复核存在性，
+// 与并发清理互斥，不会出现「已冻结但留存中找不到」的记录。
 func (r *Registry) FreezeByCriteria(st *store.Store, c Criteria) (*Report, error) {
 	if c.IsZero() {
 		return nil, ErrEmptyCriteria
@@ -221,7 +249,26 @@ func (r *Registry) FreezeByCriteria(st *store.Store, c Criteria) (*Report, error
 		return nil, err
 	}
 	rep := &Report{Op: "freeze", Criteria: &c}
-	rep.Changed = r.apply(logEntry{Op: "freeze", Criteria: &c, Ts: time.Now()}, matched)
+	le := logEntry{Op: "freeze", Criteria: &c, Ts: time.Now()}
+	err = st.ApplyUnderLock(func(v store.LockedView) error {
+		// 锁内复核：只冻结仍存在的记录（记录不可变，条件判定结果不变，
+		// 只需复核存在性）。
+		still, verr := v.HasIDs(matched)
+		if verr != nil {
+			return verr
+		}
+		var alive []string
+		for _, id := range matched {
+			if still[id] {
+				alive = append(alive, id)
+			}
+		}
+		rep.Changed = r.apply(le, alive)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	return rep, nil
 }
 

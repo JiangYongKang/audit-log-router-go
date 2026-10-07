@@ -89,6 +89,21 @@ freeze.Registry：合规冻结（legal hold），freeze.log 持久化，重启�
   （保留期与容量两个阶段都跳过），跳过的段写入 `PurgeReport.Reason`
   （`kept_frozen_segments=...`）并打印运行日志。解冻本身不删除任何数据；
   下一次清理按原保留期/容量规则处理已解冻的段。
+- **与清理并发的行为约定**（冻结/解冻与留存、容量清理同时发生）：
+  - **只要一条记录在任意时刻处于冻结态，它就绝不会被清理**，直到被解冻为止都可查；
+  - 冻结生效与段删除互斥：冻结集合的变更在 store 互斥锁内完成
+    （`store.ApplyUnderLock`），生效前锁内复核记录仍存在——扫描之后、生效之前
+    被清理掉的记录不会进入冻结集合，而是计入报告的 `Skipped`；
+  - 段删除前同样在 store 锁内复核冻结状态（`Store.DeleteSegments` 的 `isFrozen`），
+    「清理标记完成后、删除执行前」新冻结的记录所在段会被保留，并在
+    `PurgeReport.KeptFrozenSegments` 与 `Reason`（`frozen_at_delete`）中说明；
+  - 因此同一条记录不会出现「既已清理、又被冻结保留」的自相矛盾；冻结/解冻计数
+    不因并发交错而重复或漂移（集合语义 + 幂等 no-op）；
+  - 解冻后记录重新按原保留期/容量规则参与清理：解冻操作本身不删数据，
+    也不会让记录永远清不掉；
+  - 清理中途取消/出错不会波及冻结记录（删除前复核是最后防线），冻结状态与
+    实际留存不会长期对不上；进程重启后 `freeze.log` 重放恢复冻结集合，
+    对同一批记录的「该保留/该清理」结论与重启前一致。
 - **与容量的关系**（确定性行为）：
   - 冻结记录永不因容量压力被挤掉；容量清理只从「不含冻结记录的封存段」中回收；
   - 若冻结占用导致无法回收到上限以下，清理报告给出 `capacity_unreclaimable:...`
@@ -105,6 +120,9 @@ freeze.Registry：合规冻结（legal hold），freeze.log 持久化，重启�
 go vet ./...
 go test ./... -race -count=1      # 单元 + 故障注入/并发/重启集成测试
 go test ./internal/router -race -v
+# 冻结/清理并发用例的稳定性验证（重复多跑 + 竞态检测，日志含每个用例的判定依据）：
+go test ./internal/retention ./internal/freeze ./internal/store \
+  -race -count=5 -run 'Freeze|Unfreeze|Sweep|DeleteSegments' -v
 ```
 
 关键测试（日志中打印判定依据）：
@@ -125,6 +143,11 @@ go test ./internal/router -race -v
 | `TestSweepSkipsFrozenSegments` / `TestUnfreezeRestoresOriginalPurge` | 冻结段跳过清理；解冻后按原规则参与清理 |
 | `TestSweepCapacityUnreclaimableWhenFrozen` | 容量被冻结占满时的确定结论，冻结记录不被挤掉 |
 | `TestConcurrentFreezeSweepAppend` | 冻结/解冻/写入/清理并发，冻结记录不丢、计数自洽 |
+| `TestConcurrentFreezeUnfreezeSweepStress` | 按 ID + 按条件冻结/解冻与清理高频交错的压力测试；解冻后容量规则恢复生效 |
+| `TestSweepDeleteTimeRecheckKeepsNewlyFrozen` | 确定性交错：清理标记后、删除前新冻结的段被锁内复核保留 |
+| `TestFreezePurgedRecordIsSkipped` | 冻结生效前记录已被清理 → 计入 Skipped，不进冻结集合 |
+| `TestDeleteSegmentsRechecksFrozenAtDeleteTime` | 段删除前锁内复核冻结状态；isFrozen=nil 时行为不变 |
+| `TestSweepWithoutFreezeHookUnchanged` | 未注册冻结钩子时清理行为与引入冻结能力前完全一致 |
 | `TestIngestRejectedWhenCapacityFrozen` / `TestIngestUnaffectedWithoutCapacityGate` | 容量门控拒绝可区分；无门控时行为不变 |
 
 示例程序：

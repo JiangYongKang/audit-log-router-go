@@ -196,9 +196,15 @@ func (s *Sweeper) Sweep(ctx context.Context, now time.Time) (*store.PurgeReport,
 		idxs = append(idxs, m.seg.Index)
 	}
 	sort.Ints(idxs)
-	rep, err := s.st.DeleteSegments(idxs)
+	// 删除前在 store 锁内复核冻结状态：标记之后、删除之前新冻结的记录
+	// 所在段会被保留并记入报告，杜绝「检查后被冻结、仍被删除」的交错。
+	rep, err := s.st.DeleteSegments(idxs, s.isFrozen)
 	if err != nil {
 		return nil, err
+	}
+	for _, seg := range rep.KeptFrozenSegments {
+		s.logf("retention: segment %06d kept at delete time (frozen_hold, count=%d)", seg.Index, seg.Count)
+		reasons = append(reasons, fmt.Sprintf("seg-%06d kept: frozen_at_delete", seg.Index))
 	}
 	rep.Reason = strings.Join(reasons, "; ")
 	return rep, nil

@@ -79,7 +79,7 @@ func TestDeleteSegmentsDeterministic(t *testing.T) {
 	}
 	st.Append(mkRec("e3"))
 	segs := st.Segments()
-	rep, err := st.DeleteSegments([]int{segs[0].Index, segs[1].Index})
+	rep, err := st.DeleteSegments([]int{segs[0].Index, segs[1].Index}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,4 +173,44 @@ func TestConcurrentAppendRotate(t *testing.T) {
 	}
 	t.Logf("判定依据: 并发写入无丢失无重复, 段数=%d", len(st.Segments()))
 	st.Close()
+}
+
+// 删除前锁内复核：候选段在删除执行时含冻结记录 → 跳过删除并写入报告；
+// isFrozen 为 nil 时行为与引入冻结能力前一致（直接删除）。
+func TestDeleteSegmentsRechecksFrozenAtDeleteTime(t *testing.T) {
+	dir := t.TempDir()
+	st, _ := Open(dir)
+	defer st.Close()
+	for i := 0; i < 2; i++ {
+		st.Append(mkRec(fmt.Sprintf("e%d", i)))
+	}
+	st.Rotate()
+	st.Append(mkRec("e2"))
+	segs := st.Segments()
+	if len(segs) != 2 || !segs[0].Sealed {
+		t.Fatalf("segments wrong: %+v", segs)
+	}
+
+	// 复核时 e0 已处于冻结态：整段保留，结论写入报告。
+	isFrozen := func(id string) bool { return id == "e0" }
+	rep, err := st.DeleteSegments([]int{segs[0].Index}, isFrozen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.DeletedCount != 0 || len(rep.KeptFrozenSegments) != 1 {
+		t.Fatalf("frozen segment must be kept at delete time: %+v", rep)
+	}
+	if st.Count() != 3 {
+		t.Fatalf("frozen segment must survive: count=%d", st.Count())
+	}
+
+	// 无冻结判定（nil）：同一段被正常删除，行为与引入冻结能力前一致。
+	rep, err = st.DeleteSegments([]int{segs[0].Index}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.DeletedCount != 2 || len(rep.KeptFrozenSegments) != 0 || st.Count() != 1 {
+		t.Fatalf("nil isFrozen must delete unconditionally: %+v count=%d", rep, st.Count())
+	}
+	t.Log("判定依据: 删除时锁内复核冻结状态, 命中则保留并记录; isFrozen=nil 时行为不变")
 }

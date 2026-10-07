@@ -294,3 +294,195 @@ func (w testLogWriter) Write(p []byte) (int, error) {
 	w.t.Log(strings.TrimSpace(string(p)))
 	return len(p), nil
 }
+
+// 确定性交错：清理「标记」完成后、「删除」执行前记录被并发冻结。
+// 用会在两次调用间翻转的 isFrozen 模拟该时序：预检阶段未冻结（段被标记删除），
+// 删除阶段锁内复核发现已冻结 → 段必须被保留，结论写入报告。
+func TestSweepDeleteTimeRecheckKeepsNewlyFrozen(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-48 * time.Hour)
+	st := newStoreWithSegs(t, 2, []time.Time{old, now}) // 段0 封存超期，段1 活动
+	defer st.Close()
+
+	call := 0
+	var mu sync.Mutex
+	isFrozen := func(id string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		call++
+		if call <= 2 { // 预检阶段扫描段0的2条记录：尚未冻结
+			return false
+		}
+		return id == "s0-e0" // 删除阶段复核：s0-e0 已被并发冻结
+	}
+
+	sw := New(st, time.Hour, 24*time.Hour, 0, 0)
+	sw.SetFreezeHook(isFrozen, nil)
+	rep, err := sw.Sweep(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.DeletedCount != 0 || len(rep.KeptFrozenSegments) != 1 {
+		t.Fatalf("segment frozen mid-sweep must be kept: %+v", rep)
+	}
+	if !strings.Contains(rep.Reason, "frozen_at_delete") {
+		t.Fatalf("reason must explain delete-time freeze keep: %q", rep.Reason)
+	}
+	if !recordExists(st, "s0-e0") || !recordExists(st, "s0-e1") {
+		t.Fatal("records frozen mid-sweep must survive")
+	}
+	t.Logf("判定依据: 标记后删除前新冻结的段在锁内复核时被保留, reason=%s", rep.Reason)
+}
+
+// 未注册冻结钩子时，即使存在冻结注册表且记录已冻结，
+// 清理行为也与引入冻结能力前完全一致（按原规则删除）。
+func TestSweepWithoutFreezeHookUnchanged(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-48 * time.Hour)
+	st := newStoreWithSegs(t, 2, []time.Time{old, old, now}) // 段0/1 封存超期，段2 活动
+	defer st.Close()
+	reg := newFreezeRegistry(t)
+	if _, err := reg.FreezeIDs(st, "s0-e0", "s1-e0"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 不调用 SetFreezeHook：冻结状态对清理不可见，行为与以前一致。
+	sw := New(st, time.Hour, 24*time.Hour, 0, 0)
+	rep, err := sw.Sweep(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.DeletedCount != 4 || st.Count() != 2 {
+		t.Fatalf("without hook, original rules must apply: %+v count=%d", rep, st.Count())
+	}
+	if recordExists(st, "s0-e0") || recordExists(st, "s1-e0") {
+		t.Fatal("without hook, frozen records are purged as before (hook is opt-in)")
+	}
+	t.Logf("判定依据: 未注册冻结钩子时清理行为与引入冻结能力前一致, reason=%s", rep.Reason)
+}
+
+// 并发交错压力测试：按 ID 与按条件的冻结/解冻、写入、轮转、清理同时进行。
+// 不变量：任何时刻处于冻结态的记录绝不被清理；终态计数自洽、无重复；
+// 解冻后的记录重新按原规则参与清理。
+func TestConcurrentFreezeUnfreezeSweepStress(t *testing.T) {
+	st, _ := store.Open(t.TempDir())
+	defer st.Close()
+	reg := newFreezeRegistry(t)
+	// 容量上限 40、段阈值 1 字节：每条记录即轮转，清理频繁挤出。
+	sw := New(st, time.Millisecond, 0, 40, 1)
+	logger := log.New(testLogWriter{t}, "[retention-stress] ", 0)
+	sw.SetFreezeHook(reg.IsFrozen, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	// 写入：4 个写者，ID 前缀确定，时间戳有老有新。
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				ts := time.Now()
+				if i%5 == 0 {
+					ts = ts.Add(-48 * time.Hour) // 一部分超期，制造清理压力
+				}
+				st.Append(mkRecAt(fmt.Sprintf("w%d-%d", w, i), ts))
+			}
+		}(w)
+	}
+	// 按 ID 冻结/解冻。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			id := fmt.Sprintf("w1-%d", i%25)
+			reg.FreezeIDs(st, id)
+			if i%2 == 0 {
+				reg.UnfreezeIDs(id)
+			}
+		}
+	}()
+	// 按条件冻结/解冻（同一来源，交错进行）。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 30; i++ {
+			reg.FreezeByCriteria(st, freeze.Criteria{Actor: "u"})
+			if i%2 == 0 {
+				reg.UnfreezeByCriteria(st, freeze.Criteria{Actor: "u"})
+			}
+		}
+	}()
+	// 清理循环：每次清理后，当前冻结的记录必须全部存活（不变量）。
+	var sweepErr error
+	var smu sync.Mutex
+	sweepDone := make(chan struct{})
+	go func() {
+		defer close(sweepDone)
+		for ctx.Err() == nil {
+			if _, err := sw.Sweep(ctx, time.Now()); err != nil && ctx.Err() == nil {
+				smu.Lock()
+				sweepErr = err
+				smu.Unlock()
+				return
+			}
+			for _, id := range reg.FrozenIDs() {
+				if !recordExists(st, id) {
+					smu.Lock()
+					sweepErr = fmt.Errorf("frozen record %s was purged", id)
+					smu.Unlock()
+					return
+				}
+			}
+		}
+	}()
+	wg.Wait()
+	cancel()
+	<-sweepDone
+
+	smu.Lock()
+	err := sweepErr
+	smu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 终态自洽：Count 与扫描一致、无重复；仍冻结的记录全部存活。
+	recs, err := st.ScanSeqs(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(recs)) != st.Count() {
+		t.Fatalf("count mismatch: scan=%d Count=%d", len(recs), st.Count())
+	}
+	seen := map[string]bool{}
+	for _, r := range recs {
+		if seen[r.ID] {
+			t.Fatalf("duplicate after stress: %s", r.ID)
+		}
+		seen[r.ID] = true
+	}
+	frozen := reg.FrozenIDs()
+	for _, id := range frozen {
+		if !seen[id] {
+			t.Fatalf("frozen record %s missing at end", id)
+		}
+	}
+
+	// 全部解冻后：按原容量规则重新参与清理——不会永远清不掉。
+	if _, err := reg.UnfreezeIDs(frozen...); err != nil {
+		t.Fatal(err)
+	}
+	if reg.FrozenCount() != 0 {
+		t.Fatalf("all records must be unfrozen: %d", reg.FrozenCount())
+	}
+	if _, err := sw.Sweep(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if st.Count() > 40 {
+		t.Fatalf("after unfreeze, capacity rule must reclaim: count=%d > 40", st.Count())
+	}
+	t.Logf("判定依据: 并发交错后 count=%d 无重复, 冻结记录全程存活; 解冻后容量规则恢复生效 count<=%d",
+		st.Count(), 40)
+}

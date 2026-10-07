@@ -40,7 +40,10 @@ type Segment struct {
 type PurgeReport struct {
 	DeletedSegments []Segment
 	DeletedCount    int64
-	Reason          string
+	// KeptFrozenSegments 是删除阶段锁内复核时发现含冻结记录而被保留的段
+	// （仅当 DeleteSegments 收到非 nil 的 isFrozen 时可能出现）。
+	KeptFrozenSegments []Segment
+	Reason             string
 }
 
 // Store 管理事件日志段。
@@ -200,6 +203,11 @@ func (s *Store) Append(r event.Record) (int64, error) {
 func (s *Store) ScanSeqs(ctx context.Context, from int64, to int64) ([]event.Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.scanSeqsLocked(ctx, from, to)
+}
+
+// scanSeqsLocked 是 ScanSeqs 的锁内版本（调用方须持有 s.mu）。
+func (s *Store) scanSeqsLocked(ctx context.Context, from int64, to int64) ([]event.Record, error) {
 	var out []event.Record
 	paths := make([]string, 0, len(s.sealed)+1)
 	for _, seg := range s.sealed {
@@ -215,6 +223,39 @@ func (s *Store) ScanSeqs(ctx context.Context, from int64, to int64) ([]event.Rec
 			return nil, err
 		}
 		out = append(out, recs...)
+	}
+	return out, nil
+}
+
+// LockedView 是 store 互斥锁保护下的只读视图，供「检查-变更」复合操作
+// 在持锁回调中复核记录是否仍然存在；视图存活期间不会有段被删除或轮转。
+type LockedView struct{ s *Store }
+
+// ApplyUnderLock 在持有 store 互斥锁期间执行 fn。
+// 用于让外部状态（如冻结集合）的变更与段删除互斥：fn 完成前，
+// DeleteSegments/Rotate 都不可能插入。锁序约定：store 锁内允许再获取
+// freeze 锁（store -> freeze），反向禁止。
+func (s *Store) ApplyUnderLock(fn func(v LockedView) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return fn(LockedView{s: s})
+}
+
+// HasIDs 返回 ids 中当前仍存在于留存中的子集（须经由 ApplyUnderLock 调用）。
+func (v LockedView) HasIDs(ids []string) (map[string]bool, error) {
+	recs, err := v.s.scanSeqsLocked(context.Background(), 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[string]bool, len(recs))
+	for _, rec := range recs {
+		existing[rec.ID] = true
+	}
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if existing[id] {
+			out[id] = true
+		}
 	}
 	return out, nil
 }
@@ -270,22 +311,29 @@ func (s *Store) ReclaimableCount(isFrozen func(id string) bool) (int64, error) {
 			n += seg.Count
 			continue
 		}
-		recs, err := scanFile(seg.Path, seg.StartSeq, seg.EndSeq+1)
+		frozen, err := s.segHasFrozenLocked(seg, isFrozen)
 		if err != nil {
 			return n, err
-		}
-		frozen := false
-		for _, rec := range recs {
-			if isFrozen(rec.ID) {
-				frozen = true
-				break
-			}
 		}
 		if !frozen {
 			n += seg.Count
 		}
 	}
 	return n, nil
+}
+
+// segHasFrozenLocked 判断段内是否含冻结记录（调用方须持有 s.mu）。
+func (s *Store) segHasFrozenLocked(seg Segment, isFrozen func(id string) bool) (bool, error) {
+	recs, err := scanFile(seg.Path, seg.StartSeq, seg.EndSeq+1)
+	if err != nil {
+		return false, err
+	}
+	for _, rec := range recs {
+		if isFrozen(rec.ID) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Count 返回当前留存的事件总数（活动段 + 封存段）。
@@ -347,7 +395,13 @@ func (s *Store) ActiveBytes() int64 {
 
 // DeleteSegments 按段索引删除封存段（确定顺序：按索引升序）。
 // 活动段不可删除。返回解释性报告。
-func (s *Store) DeleteSegments(indexes []int) (*PurgeReport, error) {
+//
+// isFrozen 非 nil 时，在 store 锁内对每个候选段做删除前复核：含冻结记录的段
+// 跳过删除并记入报告的 KeptFrozenSegments。由于冻结集合的变更同样在 store 锁
+// 内生效（见 ApplyUnderLock），复核与删除之间不可能插入冻结变更，杜绝
+// 「检查时被判未冻结、删除前已被冻结」的交错。isFrozen 为 nil 时行为与引入
+// 冻结能力前完全一致。
+func (s *Store) DeleteSegments(indexes []int, isFrozen func(id string) bool) (*PurgeReport, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sort.Ints(indexes)
@@ -359,6 +413,16 @@ func (s *Store) DeleteSegments(indexes []int) (*PurgeReport, error) {
 			if seg.Index == idx {
 				del = true
 				break
+			}
+		}
+		if del && isFrozen != nil {
+			frozen, err := s.segHasFrozenLocked(seg, isFrozen)
+			if err != nil {
+				return rep, err
+			}
+			if frozen {
+				del = false
+				rep.KeptFrozenSegments = append(rep.KeptFrozenSegments, seg)
 			}
 		}
 		if del {
